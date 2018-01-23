@@ -1,9 +1,11 @@
-﻿using Microsoft.AspNetCore.Authentication.Cookies;
+﻿using Microsoft.ApplicationInsights.Extensibility;
+using Microsoft.ApplicationInsights.ServiceFabric;
+using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authentication.OpenIdConnect;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
-using Microsoft.eShopOnContainers.BuildingBlocks;
 using Microsoft.eShopOnContainers.BuildingBlocks.Resilience.Http;
 using Microsoft.eShopOnContainers.WebMVC.Infrastructure;
 using Microsoft.eShopOnContainers.WebMVC.Services;
@@ -12,9 +14,11 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.HealthChecks;
 using Microsoft.Extensions.Logging;
+using StackExchange.Redis;
 using System;
 using System.IdentityModel.Tokens.Jwt;
 using WebMVC.Infrastructure;
+using WebMVC.Infrastructure.Middlewares;
 using WebMVC.Services;
 
 namespace Microsoft.eShopOnContainers.WebMVC
@@ -31,7 +35,10 @@ namespace Microsoft.eShopOnContainers.WebMVC
         // This method gets called by the runtime. Use this method to add services to the container.
         public void ConfigureServices(IServiceCollection services)
         {
-            services.AddMvc();            
+            RegisterAppInsights(services);
+
+            services.AddMvc();
+
             services.AddSession();
 
             if (Configuration.GetValue<string>("IsClusterEnv") == bool.TrueString)
@@ -40,7 +47,7 @@ namespace Microsoft.eShopOnContainers.WebMVC
                 {
                     opts.ApplicationDiscriminator = "eshop.webmvc";
                 })
-                .PersistKeysToRedis(Configuration["DPConnectionString"]);
+                .PersistKeysToRedis(ConnectionMultiplexer.Connect(Configuration["DPConnectionString"]), "DataProtection-Keys");
             }
 
             services.Configure<AppSettings>(Configuration);
@@ -52,11 +59,12 @@ namespace Microsoft.eShopOnContainers.WebMVC
                 {
                     minutes = minutesParsed;
                 }
-                checks.AddUrlCheck(Configuration["CatalogUrl"] + "/hc", TimeSpan.FromMinutes(minutes));
-                checks.AddUrlCheck(Configuration["OrderingUrl"] + "/hc", TimeSpan.FromMinutes(minutes));
-                checks.AddUrlCheck(Configuration["BasketUrl"] + "/hc", TimeSpan.FromMinutes(minutes));
-                checks.AddUrlCheck(Configuration["IdentityUrl"] + "/hc", TimeSpan.FromMinutes(minutes));
-                checks.AddUrlCheck(Configuration["MarketingUrl"] + "/hc", TimeSpan.FromMinutes(minutes));
+
+                checks.AddUrlCheck(Configuration["CatalogUrlHC"], TimeSpan.FromMinutes(minutes));
+                checks.AddUrlCheck(Configuration["OrderingUrlHC"], TimeSpan.FromMinutes(minutes));
+                checks.AddUrlCheck(Configuration["BasketUrlHC"], TimeSpan.Zero); //No cache for this HealthCheck, better just for demos 
+                checks.AddUrlCheck(Configuration["IdentityUrlHC"], TimeSpan.FromMinutes(minutes));
+                checks.AddUrlCheck(Configuration["MarketingUrlHC"], TimeSpan.FromMinutes(minutes));
             });
 
             // Add application services.
@@ -70,7 +78,25 @@ namespace Microsoft.eShopOnContainers.WebMVC
 
             if (Configuration.GetValue<string>("UseResilientHttp") == bool.TrueString)
             {
-                services.AddSingleton<IResilientHttpClientFactory, ResilientHttpClientFactory>();
+                services.AddSingleton<IResilientHttpClientFactory, ResilientHttpClientFactory>(sp =>
+                {
+                    var logger = sp.GetRequiredService<ILogger<ResilientHttpClient>>();
+                    var httpContextAccessor = sp.GetRequiredService<IHttpContextAccessor>();
+
+                    var retryCount = 6;
+                    if (!string.IsNullOrEmpty(Configuration["HttpClientRetryCount"]))
+                    {
+                        retryCount = int.Parse(Configuration["HttpClientRetryCount"]);
+                    }
+
+                    var exceptionsAllowedBeforeBreaking = 5;
+                    if (!string.IsNullOrEmpty(Configuration["HttpClientExceptionsAllowedBeforeBreaking"]))
+                    {
+                        exceptionsAllowedBeforeBreaking = int.Parse(Configuration["HttpClientExceptionsAllowedBeforeBreaking"]);
+                    }
+
+                    return new ResilientHttpClientFactory(logger, httpContextAccessor, exceptionsAllowedBeforeBreaking, retryCount);
+                });
                 services.AddSingleton<IHttpClient, ResilientHttpClient>(sp => sp.GetService<IResilientHttpClientFactory>().CreateResilientHttpClient());
             }
             else
@@ -114,6 +140,8 @@ namespace Microsoft.eShopOnContainers.WebMVC
 
             loggerFactory.AddConsole(Configuration.GetSection("Logging"));
             loggerFactory.AddDebug();
+            loggerFactory.AddAzureWebAppDiagnostics();
+            loggerFactory.AddApplicationInsights(app.ApplicationServices, LogLevel.Trace);
 
             if (env.IsDevelopment())
             {
@@ -135,6 +163,11 @@ namespace Microsoft.eShopOnContainers.WebMVC
             app.UseSession();
             app.UseStaticFiles();
 
+            if (Configuration.GetValue<bool>("UseLoadTest"))
+            {
+                app.UseMiddleware<ByPassAuthMiddleware>();
+            }
+            
             app.UseAuthentication();
 
             var log = loggerFactory.CreateLogger("identity");
@@ -151,6 +184,24 @@ namespace Microsoft.eShopOnContainers.WebMVC
                     name: "defaultError",
                     template: "{controller=Error}/{action=Error}");
             });
+        }
+
+        private void RegisterAppInsights(IServiceCollection services)
+        {
+            services.AddApplicationInsightsTelemetry(Configuration);
+            var orchestratorType = Configuration.GetValue<string>("OrchestratorType");
+
+            if (orchestratorType?.ToUpper() == "K8S")
+            {
+                // Enable K8s telemetry initializer
+                services.EnableKubernetes();
+            }
+            if (orchestratorType?.ToUpper() == "SF")
+            {
+                // Enable SF telemetry initializer
+                services.AddSingleton<ITelemetryInitializer>((serviceProvider) =>
+                    new FabricTelemetryInitializer());
+            }
         }
     }
 }

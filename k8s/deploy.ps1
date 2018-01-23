@@ -104,7 +104,7 @@ ExecKube -cmd 'delete configmap config-files'
 ExecKube -cmd 'delete configmap urls'
 ExecKube -cmd 'delete configmap externalcfg'
 
-# start sql, rabbitmq, frontend deploymentsExecKube -cmd 'delete configmap config-files'
+# start sql, rabbitmq, frontend deployments
 ExecKube -cmd 'create configmap config-files --from-file=nginx-conf=nginx.conf'
 ExecKube -cmd 'label configmap config-files app=eshop'
 
@@ -161,7 +161,8 @@ ExecKube -cmd 'create configmap urls `
     --from-literal=LocationApiClient=http://$($externalDns)/locations-api `
     --from-literal=MarketingApiClient=http://$($externalDns)/marketing-api `
     --from-literal=BasketApiClient=http://$($externalDns)/basket-api `
-    --from-literal=OrderingApiClient=http://$($externalDns)/ordering-api'
+    --from-literal=OrderingApiClient=http://$($externalDns)/ordering-api `
+    --from-literal=PaymentHealthCheckUrl=http://payment/hc'
 	
 
 ExecKube -cmd 'label configmap urls app=eshop'
